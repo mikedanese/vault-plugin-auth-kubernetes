@@ -3,9 +3,10 @@ package kubeauth
 import (
 	"context"
 	"crypto/rsa"
-	"errors"
 	"fmt"
 	"testing"
+
+	authv1 "k8s.io/api/authentication/v1"
 
 	"github.com/hashicorp/errwrap"
 	multierror "github.com/hashicorp/go-multierror"
@@ -21,24 +22,41 @@ var (
 	testGlobbedNamespace = "def*"
 	testGlobbedName      = "vault-*"
 
-	// Projected ServiceAccount tokens have name "default", and require a
-	// different mock token reviewer
-	testProjectedName        = "default"
-	testProjectedUID         = "b389b3b2-d302-11e8-b14c-080027e55ea8"
-	testProjectedMockFactory = mockTokenReviewFactory(testProjectedName, testNamespace, testProjectedUID)
-
 	testDefaultPEMs = []string{testECCert, testRSACert}
 	testNoPEMs      = []string{testECCert, testRSACert}
 )
 
+// mock review is used while testing
+type mockTokenReview struct {
+	saName      string
+	saNamespace string
+	saUID       string
+}
+
+func mockTokenReviewFactory(name, namespace, UID string) tokenReviewFactory {
+	return func(config *kubeConfig) tokenReviewer {
+		return &mockTokenReview{
+			saName:      name,
+			saNamespace: namespace,
+			saUID:       UID,
+		}
+	}
+}
+
+func (t *mockTokenReview) Review(tr *authv1.TokenReview) (*authv1.TokenReview, error) {
+	return &authv1.TokenReview{
+		Spec: tr.Spec,
+		Status: authv1.TokenReviewStatus{
+			User: authv1.UserInfo{
+				Username: fmt.Sprintf("system:serviceaccount:%s:%s", t.saNamespace, t.saName),
+				UID:      t.saUID,
+			},
+		},
+	}, nil
+}
+
 func setupBackend(t *testing.T, pems []string, saName string, saNamespace string) (logical.Backend, logical.Storage) {
 	b, storage := getBackend(t)
-
-	// pems := []string{testECCert, testRSACert, testMinikubePubKey}
-	// pems := []string{testECCert, testRSACert}
-	// if noPEMs {
-	// 	pems = []string{}
-	// }
 
 	// test no certificate
 	data := map[string]interface{}{
@@ -166,7 +184,7 @@ func TestLogin(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if err.Error() != "service account name not authorized" {
+	if err.Error() != "JWT names did not match" {
 		t.Fatalf("unexpected error: %s", err)
 	}
 
@@ -329,7 +347,7 @@ func TestLogin_NoPEMs(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if err.Error() != "service account name not authorized" {
+	if err.Error() != "JWT names did not match" {
 		t.Fatalf("unexpected error: %s", err)
 	}
 
@@ -395,184 +413,4 @@ var ecdsaKey = `-----BEGIN PUBLIC KEY-----
 MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEC1uWSXj2czCDwMTLWV5BFmwxdM6PX9p+
 Pk9Yf9rIf374m5XP1U8q79dBhLSIuaojsvOT39UUcPJROSD1FqYLued0rXiooIii
 1D3jaW6pmGVJFhodzC31cy5sfOYotrzF
------END PUBLIC KEY-----`
-
-func TestLoginProjectedToken(t *testing.T) {
-	b, storage := setupBackend(t, append(testDefaultPEMs, testMinikubePubKey), testName, testNamespace)
-
-	// update backend to accept "default" bound account name
-	data := map[string]interface{}{
-		"bound_service_account_names":      fmt.Sprintf("%s,default", testName),
-		"bound_service_account_namespaces": testNamespace,
-		"policies":                         "test",
-		"period":                           "3s",
-		"ttl":                              "1s",
-		"num_uses":                         12,
-		"max_ttl":                          "5s",
-	}
-
-	req := &logical.Request{
-		Operation: logical.CreateOperation,
-		Path:      "role/plugin-test",
-		Storage:   storage,
-		Data:      data,
-	}
-
-	resp, err := b.HandleRequest(context.Background(), req)
-	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%s resp:%#v\n", err, resp)
-	}
-
-	var roleNameError = fmt.Errorf("invalid role name \"%s\"", "plugin-test-x")
-
-	testCases := map[string]struct {
-		role        string
-		jwt         string
-		tokenReview tokenReviewFactory
-		e           error
-	}{
-		"normal": {
-			role:        "plugin-test",
-			jwt:         jwtData,
-			tokenReview: testMockFactory,
-		},
-		"fail": {
-			role:        "plugin-test-x",
-			jwt:         jwtData,
-			tokenReview: testMockFactory,
-			e:           roleNameError,
-		},
-		"projected-token": {
-			role:        "plugin-test",
-			jwt:         jwtProjectedData,
-			tokenReview: testProjectedMockFactory,
-		},
-		"projected-token-expired": {
-			role:        "plugin-test",
-			jwt:         jwtProjectedDataExpired,
-			tokenReview: testProjectedMockFactory,
-			e:           errors.New("token is expired"), // jwt.ErrTokenIsExpired,
-		},
-		"projected-token-invalid-role": {
-			role:        "plugin-test-x",
-			jwt:         jwtProjectedData,
-			tokenReview: testProjectedMockFactory,
-			e:           roleNameError,
-		},
-	}
-
-	for k, tc := range testCases {
-		t.Run(k, func(t *testing.T) {
-
-			data := map[string]interface{}{
-				"role": tc.role,
-				"jwt":  tc.jwt,
-			}
-
-			req := &logical.Request{
-				Operation: logical.UpdateOperation,
-				Path:      "login",
-				Storage:   storage,
-				Data:      data,
-				Connection: &logical.Connection{
-					RemoteAddr: "127.0.0.1",
-				},
-			}
-
-			b.(*kubeAuthBackend).reviewFactory = tc.tokenReview
-
-			resp, err := b.HandleRequest(context.Background(), req)
-			if err != nil && tc.e == nil {
-				t.Fatalf("unexpected err: (%s) resp:%#v\n", err, resp)
-			}
-			if resp != nil && resp.IsError() {
-				if tc.e == nil {
-					t.Fatalf("unexpected err: (%s)\n", resp.Error())
-				}
-				if tc.e.Error() != resp.Error().Error() {
-					t.Fatalf("error mismatch, expected (%s) got (%s)", tc.e, resp.Error())
-				}
-			}
-		})
-	}
-}
-
-// jwtProjectedData is a Projected Service Account jwt with expiration set to
-// October 19, 2020
-//
-// {
-//   "aud": [
-//     "kubernetes.default.svc"
-//   ],
-//   "exp": 1603053563,
-//   "iat": 1539981563,
-//   "iss": "kubernetes/serviceaccount",
-//   "kubernetes.io": {
-//     "namespace": "default",
-//     "pod": {
-//       "name": "vault",
-//       "uid": "1006a06c-d3df-11e8-8fe2-080027e55ea8"
-//     },
-//     "serviceaccount": {
-//       "name": "default",
-//       "uid": "b389b3b2-d302-11e8-b14c-080027e55ea8"
-//     }
-//   },
-//   "nbf": 1539981563,
-//   "sub": "system:serviceaccount:default:default"
-// }
-var jwtProjectedData = "eyJhbGciOiJSUzI1NiIsImtpZCI6IiJ9.eyJhdWQiOlsia3ViZXJuZXRlcy5kZWZhdWx0LnN2YyJdLCJleHAiOjE2MDMwNTM1NjMsImlhdCI6MTUzOTk4MTU2MywiaXNzIjoia3ViZXJuZXRlcy9zZXJ2aWNlYWNjb3VudCIsImt1YmVybmV0ZXMuaW8iOnsibmFtZXNwYWNlIjoiZGVmYXVsdCIsInBvZCI6eyJuYW1lIjoidmF1bHQiLCJ1aWQiOiIxMDA2YTA2Yy1kM2RmLTExZTgtOGZlMi0wODAwMjdlNTVlYTgifSwic2VydmljZWFjY291bnQiOnsibmFtZSI6ImRlZmF1bHQiLCJ1aWQiOiJiMzg5YjNiMi1kMzAyLTExZTgtYjE0Yy0wODAwMjdlNTVlYTgifX0sIm5iZiI6MTUzOTk4MTU2Mywic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OmRlZmF1bHQ6ZGVmYXVsdCJ9.byu3BpCbs0tzQvEBCRTayXF3-kV1Ey7YvStBcCwovfSl6evBze43FFaDps78HtdDAMszjE_yn55_1BMN87EzOZYsF3GBoPLWxkofxhPIy88wmPTpurBsSx-nCKdjf4ayXhTpqGG9gy0xlkUc_xL4pM3Q8XZiqYqwq_T0PHXOpSfdzVy1oabFSZXr5QTZ377v8bvrMgAVWJF_4vZsSMG3XVCK8KBWNRw4_wt6yOelVKE5OGLPJvNu1CFjEKh4HBFBcQnB_Sgpe1nPlnm5utp-1-OVfd7zopOGDAp_Pk_Apu8OPDdPSafn6HpzIeuhMtWXcv1K8ZhZYDLC1wLywZPNyw"
-
-// jwtProjectedDataExpired is a Projected Service Account jwt with expiration
-// set to October 19, 2018
-//
-// {
-//   "aud": [
-//     "kubernetes.default.svc"
-//   ],
-//   "exp": 1539903397,
-//   "iat": 1539896197,
-//   "iss": "kubernetes/serviceaccount",
-//   "kubernetes.io": {
-//     "namespace": "default",
-//     "pod": {
-//       "name": "vault",
-//       "uid": "78b924ad-d303-11e8-b14c-080027e55ea8"
-//     },
-//     "serviceaccount": {
-//       "name": "default",
-//       "uid": "b389b3b2-d302-11e8-b14c-080027e55ea8"
-//     }
-//   },
-//   "nbf": 1539896197,
-//   "sub": "system:serviceaccount:default:default"
-// }
-var jwtProjectedDataExpired = "eyJhbGciOiJSUzI1NiIsImtpZCI6IiJ9.eyJhdWQiOlsia3ViZXJuZXRlcy5kZWZhdWx0LnN2YyJdLCJleHAiOjE1Mzk5NzA1NzUsImlhdCI6MTUzOTk2MzM3NSwiaXNzIjoia3ViZXJuZXRlcy9zZXJ2aWNlYWNjb3VudCIsImt1YmVybmV0ZXMuaW8iOnsibmFtZXNwYWNlIjoiZGVmYXVsdCIsInBvZCI6eyJuYW1lIjoidmF1bHQiLCJ1aWQiOiJiNmMyNThmNS1kM2I0LTExZTgtOGVmNC0wODAwMjdlNTVlYTgifSwic2VydmljZWFjY291bnQiOnsibmFtZSI6ImRlZmF1bHQiLCJ1aWQiOiJiMzg5YjNiMi1kMzAyLTExZTgtYjE0Yy0wODAwMjdlNTVlYTgifX0sIm5iZiI6MTUzOTk2MzM3NSwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OmRlZmF1bHQ6ZGVmYXVsdCJ9.C0waXVzwShlLM3ahJkU9LH5qcFhZ2E_p7zUCkTNf0aOtu25CpF7ARsiUty_smQhLizC5wTj7GUMzXzDSkDMh6ZJEciac6UW4g2Nz9HSh3X1DS8bvP3hX_QP_TYip7DoA4mvl7ThzFbbfmRZAfjnAdJBhKX_NxJWxEfxflYwI71CMtGAu4P7IR1Dlj5tdkUR7crQl9Q7vP4nH_s0f695RkDEJT17J6ynGYVr8VMLsHbEKEJ_JqUYFVdGnYVy-Q2hQ-4JTk-5vwug72mdrDDalSSx3KPqkIJklv0kjbLmCUPyge3cpiEvhr5M79TNHNEnlRDA5xLgMNp--HcjzXNdajQ"
-
-// testMinikubePubKey is the public key of the minikube instance used to
-// generate the projected token signature for jwtProjectedData and
-// jwtProjectedDataExpired above.
-//
-// To setup a minikube instance to replicate or re-generate keys if needed, use
-// this invocation:
-//
-// minikube start --kubernetes-version v1.12.1  \
-//   --feature-gates="TokenRequest=true,TokenRequestProjection=true" \
-//   --extra-config=apiserver.service-account-signing-key-file=/var/lib/minikube/certs/sa.key \
-//   --extra-config=apiserver.service-account-issuer="kubernetes/serviceaccount" \
-//   --extra-config=apiserver.service-account-api-audiences="kubernetes.default.svc" \
-//   --extra-config=apiserver.service-account-key-file=/var/lib/minikube/certs/sa.pub
-//
-// When Minikube is up, use `minikube ssh` to connect and extract the contents
-// of sa.pub for use here.
-//
-var testMinikubePubKey = `
------BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnz2IA2XKkdKqcRI1AfBi
-Q836H1vrYWjwh96m5b1TgOzZXx+xZfsZ+7csJP7Umn3Q5wlLI1rokrJHuoEoQEmQ
-lsShMkmPGEXpXctYU4rk3s6xd9Iqp6zq1kZnoPz2Q3w1k3SrcePZFEe2PaYtvdv9
-C5Y4sXsAuPACyaMtCWDVROpGD4c4V5TpenGSUR4Pv7IVeoH1rSaPc5gdkF2JDwgD
-ubAfMIRxlN3nY+KHsSGyzFuaXrLbKVI+EzDY22INN5S1qHH7ytKIM2mZ52kTRK/D
-0mZ7PLuq6qRuokHTkUiCY3y2OEcXNHroqxuiZGyUKKzYcRDO67Ai0Nqf6waCm0YC
-kQIDAQAB
 -----END PUBLIC KEY-----`

@@ -1,3 +1,7 @@
 pkg/*
 bin/*
 .idea/*
+
+# Vim-related files
+[._]*.s[a-w][a-z]
+[._]s[a-w][a-z]
