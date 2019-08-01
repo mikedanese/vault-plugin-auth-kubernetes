@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/briankassouf/jose/jws"
-
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/cidrutil"
 	"github.com/hashicorp/vault/sdk/helper/strutil"

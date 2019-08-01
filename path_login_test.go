@@ -13,17 +13,19 @@ import (
 	"github.com/hashicorp/vault/sdk/logical"
 )
 
-var (
-	testNamespace   = "default"
-	testName        = "vault-auth"
-	testUID         = "d77f89bc-9055-11e7-a068-0800276d99bf"
-	testMockFactory = mockTokenReviewFactory(testName, testNamespace, testUID)
+const (
+	testNamespace = "default"
+	testName      = "vault-auth"
+	testUID       = "d77f89bc-9055-11e7-a068-0800276d99bf"
+	invalidName   = "vault-invalid"
+	invalidUID    = "044fd4f1-974d-11e7-9a15-0800276d99bf"
 
 	testGlobbedNamespace = "def*"
 	testGlobbedName      = "vault-*"
+)
 
+var (
 	testDefaultPEMs = []string{testECCert, testRSACert}
-	testNoPEMs      = []string{testECCert, testRSACert}
 )
 
 // mock review is used while testing
@@ -33,17 +35,7 @@ type mockTokenReview struct {
 	saUID       string
 }
 
-func mockTokenReviewFactory(name, namespace, UID string) tokenReviewFactory {
-	return func(config *kubeConfig) tokenReviewer {
-		return &mockTokenReview{
-			saName:      name,
-			saNamespace: namespace,
-			saUID:       UID,
-		}
-	}
-}
-
-func (t *mockTokenReview) Review(tr *authv1.TokenReview) (*authv1.TokenReview, error) {
+func (t mockTokenReview) Review(tr *authv1.TokenReview) (*authv1.TokenReview, error) {
 	return &authv1.TokenReview{
 		Spec: tr.Spec,
 		Status: authv1.TokenReviewStatus{
@@ -55,333 +47,215 @@ func (t *mockTokenReview) Review(tr *authv1.TokenReview) (*authv1.TokenReview, e
 	}, nil
 }
 
-func setupBackend(t *testing.T, pems []string, saName string, saNamespace string) (logical.Backend, logical.Storage) {
+func setupBackend(t *testing.T, tr tokenReviewer, config, role map[string]interface{}) (logical.Backend, logical.Storage) {
 	b, storage := getBackend(t)
 
-	// test no certificate
-	data := map[string]interface{}{
-		"pem_keys":           pems,
+	setConfigOrDie(t, b, storage, map[string]interface{}{
+		"pem_keys":           testDefaultPEMs,
 		"kubernetes_host":    "host",
 		"kubernetes_ca_cert": testCACert,
+	})
+	if config != nil {
+		setConfigOrDie(t, b, storage, config)
 	}
 
-	req := &logical.Request{
-		Operation: logical.CreateOperation,
-		Path:      "config",
-		Storage:   storage,
-		Data:      data,
-	}
-
-	resp, err := b.HandleRequest(context.Background(), req)
-	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%s resp:%#v\n", err, resp)
-	}
-
-	data = map[string]interface{}{
-		"bound_service_account_names":      saName,
-		"bound_service_account_namespaces": saNamespace,
+	setRoleOrDie(t, b, storage, map[string]interface{}{
+		"bound_service_account_names":      testName,
+		"bound_service_account_namespaces": testNamespace,
 		"policies":                         "test",
 		"period":                           "3s",
 		"ttl":                              "1s",
 		"num_uses":                         12,
 		"max_ttl":                          "5s",
+	})
+	if role != nil {
+		setRoleOrDie(t, b, storage, role)
 	}
 
-	req = &logical.Request{
-		Operation: logical.CreateOperation,
-		Path:      "role/plugin-test",
-		Storage:   storage,
-		Data:      data,
+	if tr == nil {
+		tr = mockTokenReview{
+			saName:      testName,
+			saNamespace: testNamespace,
+			saUID:       testUID,
+		}
 	}
-
-	resp, err = b.HandleRequest(context.Background(), req)
-	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%s resp:%#v\n", err, resp)
+	b.(*kubeAuthBackend).reviewFactory = func(*kubeConfig) tokenReviewer {
+		return tr
 	}
-
-	b.(*kubeAuthBackend).reviewFactory = testMockFactory
 	return b, storage
 }
 
-func TestLogin(t *testing.T) {
-	b, storage := setupBackend(t, testDefaultPEMs, testName, testNamespace)
-
-	// Test bad inputs
-	data := map[string]interface{}{
-		"jwt": jwtData,
-	}
-
-	req := &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "login",
-		Storage:   storage,
-		Data:      data,
-	}
-
-	resp, err := b.HandleRequest(context.Background(), req)
-	if resp == nil || !resp.IsError() {
-		t.Fatal("expected error")
-	}
-	if resp.Error().Error() != "missing role" {
-		t.Fatalf("unexpected error: %s", resp.Error())
-	}
-
-	data = map[string]interface{}{
-		"role": "plugin-test",
-	}
-
-	req = &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "login",
-		Storage:   storage,
-		Data:      data,
-	}
-
-	resp, err = b.HandleRequest(context.Background(), req)
-	if resp == nil || !resp.IsError() {
-		t.Fatal("expected error")
-	}
-	if resp.Error().Error() != "missing jwt" {
-		t.Fatalf("unexpected error: %s", resp.Error())
-	}
-
-	// test bad role name
-	data = map[string]interface{}{
-		"role": "plugin-test-bad",
-		"jwt":  jwtData,
-	}
-	req = &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "login",
-		Storage:   storage,
-		Data:      data,
-	}
-
-	resp, err = b.HandleRequest(context.Background(), req)
-	if resp == nil || !resp.IsError() {
-		t.Fatal("expected error")
-	}
-	if resp.Error().Error() != "invalid role name \"plugin-test-bad\"" {
-		t.Fatalf("unexpected error: %s", resp.Error())
-	}
-
-	// test bad jwt service account
-	data = map[string]interface{}{
-		"role": "plugin-test",
-		"jwt":  jwtBadServiceAccount,
-	}
-	req = &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "login",
-		Storage:   storage,
-		Data:      data,
-		Connection: &logical.Connection{
-			RemoteAddr: "127.0.0.1",
-		},
-	}
-
-	resp, err = b.HandleRequest(context.Background(), req)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if err.Error() != "JWT names did not match" {
-		t.Fatalf("unexpected error: %s", err)
-	}
-
-	// test bad jwt key
-	data = map[string]interface{}{
-		"role": "plugin-test",
-		"jwt":  jwtWithBadSigningKey,
-	}
-	req = &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "login",
-		Storage:   storage,
-		Data:      data,
-		Connection: &logical.Connection{
-			RemoteAddr: "127.0.0.1",
-		},
-	}
-
-	resp, err = b.HandleRequest(context.Background(), req)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	var expectedErr error
-	expectedErr = multierror.Append(expectedErr, errwrap.Wrapf("failed to validate JWT: {{err}}", errMismatchedSigningMethod), errwrap.Wrapf("failed to validate JWT: {{err}}", rsa.ErrVerification))
-	if err.Error() != expectedErr.Error() {
-		t.Fatalf("unexpected error: %s", err)
-	}
-
-	// test successful login
-	data = map[string]interface{}{
-		"role": "plugin-test",
-		"jwt":  jwtData,
-	}
-
-	req = &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "login",
-		Storage:   storage,
-		Data:      data,
-		Connection: &logical.Connection{
-			RemoteAddr: "127.0.0.1",
-		},
-	}
-
-	resp, err = b.HandleRequest(context.Background(), req)
-	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%s resp:%#v\n", err, resp)
-	}
-
-	// test successful login for globbed name
-	b, storage = setupBackend(t, testDefaultPEMs, testGlobbedName, testNamespace)
-
-	data = map[string]interface{}{
-		"role": "plugin-test",
-		"jwt":  jwtData,
-	}
-
-	req = &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "login",
-		Storage:   storage,
-		Data:      data,
-		Connection: &logical.Connection{
-			RemoteAddr: "127.0.0.1",
-		},
-	}
-
-	resp, err = b.HandleRequest(context.Background(), req)
-	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%s resp:%#v\n", err, resp)
-	}
-
-	// test successful login for globbed namespace
-	b, storage = setupBackend(t, testDefaultPEMs, testName, testGlobbedNamespace)
-
-	data = map[string]interface{}{
-		"role": "plugin-test",
-		"jwt":  jwtData,
-	}
-
-	req = &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "login",
-		Storage:   storage,
-		Data:      data,
-		Connection: &logical.Connection{
-			RemoteAddr: "127.0.0.1",
-		},
-	}
-
-	resp, err = b.HandleRequest(context.Background(), req)
-	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%s resp:%#v\n", err, resp)
-	}
-}
-
-func TestLogin_ECDSA_PEM(t *testing.T) {
-	b, storage := setupBackend(t, testNoPEMs, testName, testNamespace)
-
-	// test no certificate
-	data := map[string]interface{}{
-		"pem_keys":           []string{ecdsaKey},
-		"kubernetes_host":    "host",
-		"kubernetes_ca_cert": testCACert,
-	}
-
-	req := &logical.Request{
+func setConfigOrDie(t *testing.T, b logical.Backend, s logical.Storage, config map[string]interface{}) {
+	t.Helper()
+	reqOrDie(t, b, s, &logical.Request{
 		Operation: logical.CreateOperation,
 		Path:      "config",
-		Storage:   storage,
-		Data:      data,
-	}
-
-	resp, err := b.HandleRequest(context.Background(), req)
-	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%s resp:%#v\n", err, resp)
-	}
-
-	// test successful login
-	data = map[string]interface{}{
-		"role": "plugin-test",
-		"jwt":  jwtECDSASigned,
-	}
-
-	req = &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "login",
-		Storage:   storage,
-		Data:      data,
-		Connection: &logical.Connection{
-			RemoteAddr: "127.0.0.1",
-		},
-	}
-
-	resp, err = b.HandleRequest(context.Background(), req)
-	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%s resp:%#v\n", err, resp)
-	}
+		Data:      config,
+	})
 }
 
-func TestLogin_NoPEMs(t *testing.T) {
-	b, storage := setupBackend(t, testNoPEMs, testName, testNamespace)
+func setRoleOrDie(t *testing.T, b logical.Backend, s logical.Storage, role map[string]interface{}) {
+	t.Helper()
+	reqOrDie(t, b, s, &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "role/plugin-test",
+		Storage:   s,
+		Data:      role,
+	})
+}
 
-	// test bad jwt service account
-	data := map[string]interface{}{
-		"role": "plugin-test",
-		"jwt":  jwtBadServiceAccount,
-	}
-	req := &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "login",
-		Storage:   storage,
-		Data:      data,
-		Connection: &logical.Connection{
-			RemoteAddr: "127.0.0.1",
-		},
-	}
-
+func reqOrDie(t *testing.T, b logical.Backend, s logical.Storage, req *logical.Request) *logical.Response {
+	t.Helper()
+	req.Storage = s
 	resp, err := b.HandleRequest(context.Background(), req)
-	if err == nil {
-		t.Fatal("expected error")
+	if err != nil || resp.IsError() {
+		t.Fatalf("unexpected error: %v resp: %#v\n", err, resp)
 	}
-	if err.Error() != "JWT names did not match" {
-		t.Fatalf("unexpected error: %s", err)
-	}
+	return resp
+}
 
-	// test successful login
-	data = map[string]interface{}{
-		"role": "plugin-test",
-		"jwt":  jwtData,
-	}
+func TestLogin(t *testing.T) {
+	tests := map[string]struct {
+		data         map[string]interface{}
+		config, role map[string]interface{}
+		tokenReview  tokenReviewer
 
-	req = &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "login",
-		Storage:   storage,
-		Data:      data,
-		Connection: &logical.Connection{
-			RemoteAddr: "127.0.0.1",
+		expectErrStr string
+	}{
+		"no role in data": {
+			data: map[string]interface{}{
+				"jwt": jwtData,
+			},
+
+			expectErrStr: "missing role",
+		},
+		"no jwt in data": {
+			data: map[string]interface{}{
+				"role": "plugin-test",
+			},
+
+			expectErrStr: "missing jwt",
+		},
+		"bad role": {
+			data: map[string]interface{}{
+				"role": "plugin-test-bad",
+				"jwt":  jwtData,
+			},
+
+			expectErrStr: `invalid role name "plugin-test-bad"`,
+		},
+		"bad jwt service account name": {
+			data: map[string]interface{}{
+				"role": "plugin-test",
+				"jwt":  jwtBadServiceAccount,
+			},
+
+			expectErrStr: `JWT names did not match`,
+		},
+		"unauthorized jwt service account": {
+			data: map[string]interface{}{
+				"role": "plugin-test",
+				"jwt":  jwtBadServiceAccount,
+			},
+			tokenReview: mockTokenReview{
+				saName:      invalidName,
+				saNamespace: testNamespace,
+				saUID:       invalidUID,
+			},
+
+			expectErrStr: `service account name not authorized`,
+		},
+		"bad jwt signing key": {
+			data: map[string]interface{}{
+				"role": "plugin-test",
+				"jwt":  jwtWithBadSigningKey,
+			},
+
+			expectErrStr: multierror.Append(nil,
+				errwrap.Wrapf("failed to validate JWT: {{err}}", errMismatchedSigningMethod),
+				errwrap.Wrapf("failed to validate JWT: {{err}}", rsa.ErrVerification),
+			).Error(),
+		},
+
+		"successful": {
+			data: map[string]interface{}{
+				"role": "plugin-test",
+				"jwt":  jwtData,
+			},
+		},
+		"successful globbed name": {
+			data: map[string]interface{}{
+				"role": "plugin-test",
+				"jwt":  jwtData,
+			},
+			role: map[string]interface{}{
+				"bound_service_account_names":      testGlobbedName,
+				"bound_service_account_namespaces": testNamespace,
+			},
+		},
+		"successful globbed namespace": {
+			data: map[string]interface{}{
+				"role": "plugin-test",
+				"jwt":  jwtData,
+			},
+			role: map[string]interface{}{
+				"bound_service_account_names":      testName,
+				"bound_service_account_namespaces": testGlobbedNamespace,
+			},
+		},
+		"successful ecdsa": {
+			data: map[string]interface{}{
+				"role": "plugin-test",
+				"jwt":  jwtECDSASigned,
+			},
+			config: map[string]interface{}{
+				"pem_keys":           []string{ecdsaKey},
+				"kubernetes_host":    "host",
+				"kubernetes_ca_cert": testCACert,
+			},
 		},
 	}
 
-	resp, err = b.HandleRequest(context.Background(), req)
-	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%s resp:%#v\n", err, resp)
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			b, storage := setupBackend(t, test.tokenReview, test.config, test.role)
+			req := &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "login",
+				Storage:   storage,
+				Data:      test.data,
+			}
+			resp, err := b.HandleRequest(context.Background(), req)
+			if test.expectErrStr != "" {
+				if !resp.IsError() && err == nil {
+					t.Fatalf("expected error: err=%v resp=%#v", err, resp)
+				}
+
+				if resp.IsError() {
+					err = resp.Error()
+				}
+
+				if want, got := test.expectErrStr, err.Error(); want != got {
+					t.Fatalf("unexpected error: want=%q got=%q", want, got)
+				}
+				return
+			}
+
+			if resp.IsError() || err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
 func TestAliasLookAhead(t *testing.T) {
-	b, storage := setupBackend(t, testDefaultPEMs, testName, testNamespace)
+	b, storage := setupBackend(t, nil, nil, nil)
 
-	// Test bad inputs
 	data := map[string]interface{}{
 		"jwt": jwtData,
 	}
 
-	req := &logical.Request{
+	resp := reqOrDie(t, b, storage, &logical.Request{
 		Operation: logical.AliasLookaheadOperation,
 		Path:      "login",
 		Storage:   storage,
@@ -389,12 +263,7 @@ func TestAliasLookAhead(t *testing.T) {
 		Connection: &logical.Connection{
 			RemoteAddr: "127.0.0.1",
 		},
-	}
-
-	resp, err := b.HandleRequest(context.Background(), req)
-	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%s resp:%#v\n", err, resp)
-	}
+	})
 
 	if resp.Auth.Alias.Name != testUID {
 		t.Fatalf("Unexpected UID: %s", resp.Auth.Alias.Name)
