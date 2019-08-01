@@ -91,14 +91,14 @@ func (b *kubeAuthBackend) pathLogin() framework.OperationFunc {
 		role.PopulateTokenAuth(auth)
 
 		// verify the namespace is allowed
-		if len(role.ServiceAccountNamespaces) > 1 || role.ServiceAccountNamespaces[0] != "*" {
+		if len(role.ServiceAccountNamespaces) != 0 {
 			if !strutil.StrListContainsGlob(role.ServiceAccountNamespaces, auth.Metadata["service_account_namespace"]) {
 				return nil, errors.New("namespace not authorized")
 			}
 		}
 
 		// verify the service account name is allowed
-		if len(role.ServiceAccountNames) > 1 || role.ServiceAccountNames[0] != "*" {
+		if len(role.ServiceAccountNames) != 0 {
 			if !strutil.StrListContainsGlob(role.ServiceAccountNames, auth.Metadata["service_account_name"]) {
 				return nil, errors.New("service account name not authorized")
 			}
